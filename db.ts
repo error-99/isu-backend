@@ -78,7 +78,7 @@ export const AIVEN_CONFIG: MySqlConfig = {
   host: 'mysql-5fad108-canvamse-eafe.c.aivencloud.com',
   user: 'avnadmin',
   password: 'AVNS_pbIL7isrP691yOWBkl0',
-  database: 'defaultdb',
+  database: 'isu_routine_db',
   port: 10188,
   ssl: { rejectUnauthorized: false },
 };
