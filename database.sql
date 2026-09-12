@@ -96,19 +96,31 @@ CREATE TABLE IF NOT EXISTS `routines` (
   FOREIGN KEY (`course_id`) REFERENCES `courses`(`course_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 7. Notifications Table
+-- 7. Notifications Table (Broadcast & Targeted Audience)
 CREATE TABLE IF NOT EXISTS `notifications` (
-  `id` INT PRIMARY KEY,
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `target_type` VARCHAR(20) NOT NULL DEFAULT 'all', -- 'all', 'department', 'semester', 'course', 'student'
   `student_id` VARCHAR(50) NULL,
-  `department` VARCHAR(10) NOT NULL,
+  `department` VARCHAR(10) NOT NULL DEFAULT 'ALL',
   `semester_id` INT NULL,
   `course_id` INT NULL,
   `title` VARCHAR(150) NOT NULL,
   `message` TEXT NOT NULL,
-  `type` VARCHAR(20) NOT NULL DEFAULT 'general',
+  `type` VARCHAR(20) NOT NULL DEFAULT 'general', -- 'class', 'ct', 'mid', 'final', 'urgent', 'general'
   `link` VARCHAR(255) NULL,
+  `created_by` VARCHAR(100) NULL,
   `is_read` BOOLEAN DEFAULT FALSE,
-  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (`course_id`) REFERENCES `courses`(`course_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 8. Student Notification Reads Table (Personalized read tracking across broadcast notices)
+CREATE TABLE IF NOT EXISTS `student_notification_reads` (
+  `student_id` VARCHAR(50) NOT NULL,
+  `notification_id` INT NOT NULL,
+  `read_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`student_id`, `notification_id`),
+  FOREIGN KEY (`notification_id`) REFERENCES `notifications`(`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- =============================================================

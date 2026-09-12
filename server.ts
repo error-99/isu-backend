@@ -2,59 +2,64 @@ import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import express from 'express';
 import cors from 'cors';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
-import { exportDatabaseSqlFile, getMySqlPool, isMySqlConfigured, logDatabaseError } from './backend/db';
-import apiRouter from './backend/routes';
+import { getMySqlPool, getDatabaseStatus } from './db';
+import apiRouter from './routes';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const app = express();
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 5000;
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+// Enable Cross-Origin Resource Sharing (CORS) so any frontend domain can connect
+app.use(
+  cors({
+    origin: true, // Echoes back the request origin to satisfy browser credentials mode
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization', 'Cache-Control', 'Pragma'],
+    credentials: true,
+  })
+);
 
-  // Enable CORS for external frontends or cross-origin calls
-  app.use(cors());
+// Body parser
+app.use(express.json());
 
-  // JSON request body parser
-  app.use(express.json());
+// Server root status endpoint
+app.get('/', async (req, res) => {
+  const dbStatus = await getDatabaseStatus();
+  res.json({
+    status: 'online',
+    name: 'ISU Student Routine Portal API Server',
+    version: '1.0.0',
+    documentation: '/api/health',
+    database: {
+      connected: dbStatus.connected,
+      host: dbStatus.host,
+      database: dbStatus.database,
+    },
+    cors: 'Enabled (all origins)',
+    timestamp: new Date().toISOString(),
+  });
+});
 
-  // 1. Initialize Aiven MySQL connection exclusively
-  console.log('🔌 Connecting exclusively to Aiven Cloud MySQL (defaultdb)...');
-  getMySqlPool().then((pool) => {
+// Mount all backend API routes under /api
+app.use('/api', apiRouter);
+
+// Initialize database connection on startup
+getMySqlPool()
+  .then((pool) => {
     if (pool) {
-      console.log('🚀 Aiven Cloud MySQL is connected and operational.');
+      console.log('🚀 MySQL Database connection established successfully.');
     }
-  }).catch((err) => {
-    console.error('⚠️ Aiven MySQL connection issue:', err?.message || err);
+  })
+  .catch((err) => {
+    console.error('⚠️ Initial MySQL connection issue:', err?.message || err);
   });
 
-  // 3. Mount all Backend API Routes under /api
-  app.use('/api', apiRouter);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`====================================================`);
+  console.log(`🚀 ISU Routine Backend Server is running!`);
+  console.log(`🌐 URL: http://localhost:${PORT}`);
+  console.log(`📡 API Endpoints: http://localhost:${PORT}/api`);
+  console.log(`🩺 Health Check: http://localhost:${PORT}/api/health`);
+  console.log(`====================================================`);
+});
 
-  // 4. Vite middleware for frontend (frontend/) development vs production
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      root: path.resolve(__dirname, 'frontend'),
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*all', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Routine App Server running on http://localhost:${PORT}`);
-    console.log(`📦 Backend API mounted at /api`);
-    console.log(`🎨 Frontend UI served from /src`);
-  });
-}
-
-startServer();
+export default app;
