@@ -276,6 +276,9 @@ export async function getMySqlPool(forceRetry = false): Promise<mysql.Pool | nul
     // Migrate any legacy passwords to bcrypt
     migrateRawPasswordsToBcrypt(pool).catch(() => {});
 
+    // Ensure notification audience & read-tracking tables are up to date
+    initializeNotificationTables(pool).catch(() => {});
+
     return pool;
   } catch (err: any) {
     if (pool) {
@@ -348,3 +351,43 @@ export function exportDatabaseSqlFile() {
     console.log(`ℹ️ Schema file ${SQL_EXPORT_PATH} is present and maintained.`);
   }
 }
+
+/**
+ * Ensures student_notification_reads table exists and notifications table
+ * has target_type and created_by columns for course/semester-wide broadcasts.
+ */
+export async function initializeNotificationTables(p: mysql.Pool) {
+  try {
+    // 1. Ensure student_notification_reads table exists
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS student_notification_reads (
+        student_id VARCHAR(50) NOT NULL,
+        notification_id INT NOT NULL,
+        read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (student_id, notification_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `);
+
+    // 2. Ensure notifications columns are upgraded
+    const [cols]: any = await p.query('DESCRIBE notifications');
+    const colNames = Array.isArray(cols) ? cols.map((c: any) => c.Field) : [];
+
+    if (!colNames.includes('target_type')) {
+      await p.query("ALTER TABLE notifications ADD COLUMN target_type VARCHAR(20) NOT NULL DEFAULT 'all' AFTER id");
+    }
+    if (!colNames.includes('created_by')) {
+      await p.query("ALTER TABLE notifications ADD COLUMN created_by VARCHAR(100) NULL AFTER link");
+    }
+
+    // 3. Make sure id is AUTO_INCREMENT if not already
+    const idCol = Array.isArray(cols) ? cols.find((c: any) => c.Field === 'id') : null;
+    if (idCol && !idCol.Extra?.includes('auto_increment')) {
+      try {
+        await p.query('ALTER TABLE notifications MODIFY COLUMN id INT AUTO_INCREMENT');
+      } catch {}
+    }
+  } catch (err: any) {
+    console.error('Notice on initializing notification tables:', err?.message || err);
+  }
+}
+
