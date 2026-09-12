@@ -708,38 +708,18 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Notifications from MySQL
-    if (action === 'notifications') {
-      const query = `
-        SELECT n.*, c.course_code, c.course_name
-        FROM notifications n
-        LEFT JOIN courses c ON n.course_id = c.course_id
-        WHERE (n.student_id IS NULL OR n.student_id = ?)
-          AND (n.department = ? OR n.department = 'ALL')
-        ORDER BY n.created_at DESC
-      `;
-      const [rows]: any = await pool.query(query, [student.student_id, student.department]);
-      const list = Array.isArray(rows)
-        ? rows.map((n: any) => ({
-            ...n,
-            is_read: Boolean(n.is_read),
-          }))
-        : [];
-
-      const unread_count = list.filter((n: any) => !n.is_read).length;
-      return res.json({
-        success: true,
-        data: { notifications: list, unread_count },
-      });
-    }
-
-    // Mark Notification as read
-    if (action === 'read_notification') {
-      const notifId = Number(req.body?.id || req.query.id);
-      if (notifId) {
-        await pool.query('UPDATE notifications SET is_read = 1 WHERE id = ?', [notifId]);
-      }
-      return res.json({ success: true, data: { id: notifId } });
+    // Notifications operations
+    if (
+      action === 'notifications' ||
+      action === 'unread_count' ||
+      action === 'mark_read' ||
+      action === 'read_notification' ||
+      action === 'mark_all_read' ||
+      action === 'read_all_notifications' ||
+      action === 'create_notification' ||
+      action === 'add_notification'
+    ) {
+      return handleNotificationOperations(req, res, student, pool, String(action));
     }
 
     // Change Name
@@ -917,5 +897,335 @@ router.all('/user', async (req: Request, res: Response) => {
 function totalCredits(courses: any[]): number {
   return courses.reduce((acc, c) => acc + (parseFloat(String(c.credit)) || 0), 0);
 }
+
+// -------------------------------------------------------------
+// 5. NOTIFICATIONS CONTROLLER & DEDICATED ROUTE
+// (Auto Course-enrolled, Semester-wide, Department, University-wide, & individual student_notification_reads)
+// -------------------------------------------------------------
+
+async function handleNotificationOperations(
+  req: Request,
+  res: Response,
+  student: StudentRecord,
+  pool: any,
+  action: string
+) {
+  // 1. UNREAD COUNT
+  if (action === 'unread_count') {
+    const enrolledCourses =
+      Array.isArray(student.enrolled_courses) && student.enrolled_courses.length > 0
+        ? student.enrolled_courses
+        : [0];
+
+    const query = `
+      SELECT COUNT(*) as unread_count
+      FROM notifications n
+      LEFT JOIN student_notification_reads snr 
+        ON n.id = snr.notification_id AND snr.student_id = ?
+      WHERE snr.read_at IS NULL AND (
+        n.department = 'ALL' OR n.target_type = 'all'
+        OR (n.department = ? AND (n.target_type = 'department' OR (n.semester_id IS NULL AND n.course_id IS NULL AND n.student_id IS NULL)))
+        OR (n.department = ? AND n.semester_id = ? AND (n.target_type = 'semester' OR (n.course_id IS NULL AND n.student_id IS NULL)))
+        OR (n.course_id IS NOT NULL AND n.course_id IN (?))
+        OR (n.student_id = ?)
+      )
+    `;
+    const [countRows]: any = await pool.query(query, [
+      student.student_id,
+      student.department,
+      student.department,
+      student.semester_id,
+      enrolledCourses,
+      student.student_id,
+    ]);
+
+    const count = countRows[0]?.unread_count || 0;
+    return res.json({
+      success: true,
+      data: { unread_count: Number(count) },
+    });
+  }
+
+  // 2. LIST NOTIFICATIONS
+  if (action === 'list' || action === 'notifications') {
+    const typeFilter = String(req.query.type || req.body?.type || '').trim();
+    const enrolledCourses =
+      Array.isArray(student.enrolled_courses) && student.enrolled_courses.length > 0
+        ? student.enrolled_courses
+        : [0];
+
+    let query = `
+      SELECT n.*, c.course_code, c.course_name,
+             (CASE WHEN snr.read_at IS NOT NULL THEN 1 ELSE 0 END) AS is_read
+      FROM notifications n
+      LEFT JOIN courses c ON n.course_id = c.course_id
+      LEFT JOIN student_notification_reads snr 
+        ON n.id = snr.notification_id AND snr.student_id = ?
+      WHERE (
+        -- 1. All university broadcasts
+        n.department = 'ALL' OR n.target_type = 'all'
+        -- 2. Entire department broadcasts
+        OR (n.department = ? AND (n.target_type = 'department' OR (n.semester_id IS NULL AND n.course_id IS NULL AND n.student_id IS NULL)))
+        -- 3. Semester-wide broadcasts (student's current semester & department)
+        OR (n.department = ? AND n.semester_id = ? AND (n.target_type = 'semester' OR (n.course_id IS NULL AND n.student_id IS NULL)))
+        -- 4. Course-wise broadcasts: Auto-delivered to every student enrolled in that course!
+        OR (n.course_id IS NOT NULL AND n.course_id IN (?))
+        -- 5. Direct personal message (if student_id explicitly specified)
+        OR (n.student_id = ?)
+      )
+    `;
+    const params: any[] = [
+      student.student_id,
+      student.department,
+      student.department,
+      student.semester_id,
+      enrolledCourses,
+      student.student_id,
+    ];
+
+    if (typeFilter && typeFilter !== 'all') {
+      if (typeFilter === 'mid') {
+        query += " AND (n.type = 'mid' OR n.type = 'final')";
+      } else {
+        query += ' AND n.type = ?';
+        params.push(typeFilter);
+      }
+    }
+
+    query += ' ORDER BY n.created_at DESC LIMIT 100';
+
+    const [rows]: any = await pool.query(query, params);
+    const list = Array.isArray(rows)
+      ? rows.map((n: any) => ({
+          ...n,
+          is_read: Boolean(n.is_read),
+        }))
+      : [];
+
+    const unread_count = list.filter((n: any) => !n.is_read).length;
+    return res.json({
+      success: true,
+      data: { notifications: list, count: list.length, unread_count },
+    });
+  }
+
+  // 3. MARK SINGLE NOTIFICATION AS READ (Per-student read tracking)
+  if (action === 'mark_read' || action === 'read_notification') {
+    const notifId = Number(
+      req.body?.notification_id || req.body?.id || req.query.notification_id || req.query.id
+    );
+    if (notifId) {
+      await pool.query(
+        'INSERT IGNORE INTO student_notification_reads (student_id, notification_id) VALUES (?, ?)',
+        [student.student_id, notifId]
+      );
+    }
+    return res.json({ success: true, data: { id: notifId, is_read: true } });
+  }
+
+  // 4. MARK ALL NOTIFICATIONS AS READ (Per-student read tracking)
+  if (action === 'mark_all_read' || action === 'read_all_notifications') {
+    const enrolledCourses =
+      Array.isArray(student.enrolled_courses) && student.enrolled_courses.length > 0
+        ? student.enrolled_courses
+        : [0];
+
+    const [visibleRows]: any = await pool.query(
+      `SELECT n.id
+       FROM notifications n
+       WHERE (
+         n.department = 'ALL' OR n.target_type = 'all'
+         OR (n.department = ? AND (n.target_type = 'department' OR (n.semester_id IS NULL AND n.course_id IS NULL AND n.student_id IS NULL)))
+         OR (n.department = ? AND n.semester_id = ? AND (n.target_type = 'semester' OR (n.course_id IS NULL AND n.student_id IS NULL)))
+         OR (n.course_id IS NOT NULL AND n.course_id IN (?))
+         OR (n.student_id = ?)
+       )`,
+      [
+        student.department,
+        student.department,
+        student.semester_id,
+        enrolledCourses,
+        student.student_id,
+      ]
+    );
+
+    if (Array.isArray(visibleRows) && visibleRows.length > 0) {
+      for (const row of visibleRows) {
+        await pool.query(
+          'INSERT IGNORE INTO student_notification_reads (student_id, notification_id) VALUES (?, ?)',
+          [student.student_id, row.id]
+        );
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: 'All notifications marked as read',
+      data: { unread_count: 0 },
+    });
+  }
+
+  // 5. CREATE / PUBLISH ANNOUNCEMENT (Broadcast Course-wise, Semester-wise, Department, or University-wide)
+  if (action === 'create_notification' || action === 'add_notification' || action === 'create') {
+    const title = String(req.body?.title || '').trim();
+    const message = String(req.body?.message || '').trim();
+    const type = String(req.body?.type || 'general').trim();
+    const target_type = String(req.body?.target_type || 'course').trim();
+    const course_id = req.body?.course_id ? Number(req.body.course_id) : null;
+    const semester_id = req.body?.semester_id ? Number(req.body.semester_id) : null;
+    const department = String(
+      req.body?.department || (target_type === 'all' ? 'ALL' : student.department)
+    ).trim();
+    const link = String(req.body?.link || '').trim();
+    const created_by = String(req.body?.created_by || student.name || 'Student Coordinator').trim();
+
+    if (!title || !message) {
+      return res.status(400).json({ success: false, message: 'Title and message are required' });
+    }
+
+    let courseCode = '';
+    if (course_id) {
+      const [cRows]: any = await pool.query(
+        'SELECT course_code, course_name FROM courses WHERE course_id = ?',
+        [course_id]
+      );
+      if (cRows && cRows.length > 0) {
+        courseCode = cRows[0].course_code;
+      }
+    }
+
+    const [insertRes]: any = await pool.query(
+      `INSERT INTO notifications 
+       (target_type, department, semester_id, course_id, student_id, title, message, type, link, created_by)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`,
+      [
+        target_type,
+        department,
+        semester_id,
+        course_id,
+        title,
+        message,
+        type,
+        link || null,
+        created_by,
+      ]
+    );
+
+    const targetDesc = courseCode
+      ? `course ${courseCode} (automatically delivered to all enrolled students)`
+      : semester_id
+      ? `Semester ${semester_id}`
+      : department !== 'ALL'
+      ? `Department ${department}`
+      : 'the entire university';
+
+    return res.json({
+      success: true,
+      message: `Notification published for ${targetDesc}!`,
+      data: {
+        id: insertRes.insertId,
+        title,
+        message,
+        type,
+        target_type,
+        department,
+        semester_id,
+        course_id,
+        course_code: courseCode,
+        created_by,
+      },
+    });
+  }
+
+  return res.status(400).json({ success: false, message: `Unknown notification action: ${action}` });
+}
+
+// Dedicated notifications endpoint matching frontend api.ts
+router.all('/notifications', async (req: Request, res: Response) => {
+  const student = await getAuthStudent(req);
+  if (!student) {
+    return res.status(401).json({
+      success: false,
+      message: 'Unauthorized. Please sign in.',
+    });
+  }
+
+  const pool = await getMySqlPool();
+  if (!pool) {
+    return res.status(503).json({
+      success: false,
+      message: 'MySQL Database is unavailable.',
+    });
+  }
+
+  const action = String(req.query.action || req.body?.action || 'list');
+  try {
+    return await handleNotificationOperations(req, res, student, pool, action);
+  } catch (err: any) {
+    logDatabaseError(err, `MySQL Notifications (${action})`);
+    return res.status(500).json({
+      success: false,
+      message: 'Notification operation failed: ' + (err?.message || err),
+    });
+  }
+});
+
+// Universal Proxy endpoint to bypass browser CORS or mixed-content limitations when connecting to remote backends
+router.all('/proxy', async (req: Request, res: Response) => {
+  const target = req.query.target as string;
+  console.log('🔄 /api/proxy called with target:', target);
+  if (!target || !target.startsWith('http')) {
+    return res.status(400).json({
+      success: false,
+      message: 'Missing or invalid target parameter. Must start with http:// or https://',
+    });
+  }
+
+  try {
+    const targetUrl = new URL(target);
+    const headers: Record<string, string> = {
+      Accept: 'application/json, text/plain, */*',
+    };
+
+    if (req.headers['content-type']) {
+      headers['Content-Type'] = req.headers['content-type'] as string;
+    }
+    if (req.headers.authorization) {
+      headers['Authorization'] = req.headers.authorization as string;
+    }
+
+    const fetchOptions: any = {
+      method: req.method,
+      headers,
+    };
+
+    if (
+      req.method !== 'GET' &&
+      req.method !== 'HEAD' &&
+      req.body &&
+      Object.keys(req.body).length > 0
+    ) {
+      fetchOptions.body = JSON.stringify(req.body);
+    }
+
+    const remoteRes = await fetch(targetUrl.toString(), fetchOptions);
+    const contentType = remoteRes.headers.get('content-type') || '';
+    res.status(remoteRes.status);
+
+    if (contentType.includes('application/json')) {
+      const json = await remoteRes.json();
+      return res.json(json);
+    } else {
+      const text = await remoteRes.text();
+      return res.send(text);
+    }
+  } catch (err: any) {
+    console.error('⚠️ /api/proxy error:', err);
+    return res.status(502).json({
+      success: false,
+      message: `Proxy failed to connect to remote server: ${err?.message || err}`,
+    });
+  }
+});
 
 export default router;
