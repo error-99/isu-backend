@@ -27,8 +27,8 @@ async function sendPasswordResetEmail(
   resetUrl: string
 ): Promise<void> {
   const { error } = await resend.emails.send({
-    // 1. Change the sender address here:
-    from: 'ISU Routine Portal <noreply@isustudent.edu>', 
+    // Change this line back to the testing domain:
+    from: 'ISU Routine Portal <onboarding@resend.dev>', 
     to: email,
     subject: 'Reset Your ISU Routine Password',
     
