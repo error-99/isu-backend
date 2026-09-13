@@ -27,21 +27,19 @@ async function sendPasswordResetEmail(
   resetUrl: string
 ): Promise<void> {
   const { error } = await resend.emails.send({
-    // Change this line back to the testing domain:
+    // You MUST keep this as the free testing domain to prevent crashes
     from: 'ISU Routine Portal <onboarding@resend.dev>', 
     to: email,
     subject: 'Reset Your ISU Routine Password',
-    
-    // 2. Add plain text fallback (reduces spam score)
-    text: `Hello,\n\nWe received a request to reset your account password.\n\nReset your password using this link: ${resetUrl}\n\nThis link will expire in 15 minutes.`,
-    
     html: `
       <div style="font-family:Arial,sans-serif;line-height:1.6;max-width:600px;margin:auto">
         <h2>Reset Your ISU Routine Password</h2>
         <p>Hello,</p>
         <p>We received a request to reset your account password.</p>
         <p>
+          <!-- Adding ses:no-track stops the awstrack.me wrapping -->
           <a href="${resetUrl}"
+             ses:no-track
              style="display:inline-block;padding:12px 20px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px">
             Reset Password
           </a>
