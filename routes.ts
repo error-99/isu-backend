@@ -1,4 +1,6 @@
 import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
+import nodemailer from 'nodemailer';
 import {
   getMySqlPool,
   StudentRecord,
@@ -13,6 +15,65 @@ import {
 import { hashPassword, verifyPassword, isBcryptHash } from './auth';
 
 const router = Router();
+
+// -------------------------------------------------------------
+// PASSWORD RESET EMAIL CONFIGURATION
+// -------------------------------------------------------------
+
+const emailTransporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: Number(process.env.SMTP_PORT || 465),
+  secure: process.env.SMTP_SECURE !== 'false',
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
+  },
+});
+
+async function sendPasswordResetEmail(
+  email: string,
+  resetUrl: string
+): Promise<void> {
+  const from =
+    process.env.SMTP_FROM ||
+    process.env.SMTP_USER ||
+    'no-reply@isuapp.com';
+
+  await emailTransporter.sendMail({
+    from,
+    to: email,
+    subject: 'Reset Your ISU Routine Password',
+    text: [
+      'Hello,',
+      '',
+      'We received a request to reset your ISU Routine account password.',
+      '',
+      `Reset your password using this link: ${resetUrl}`,
+      '',
+      'This link will expire in 15 minutes.',
+      'If you did not request this, you can ignore this email.',
+      '',
+      'ISU Student Routine Portal',
+    ].join('\n'),
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;max-width:600px;margin:auto">
+        <h2>Reset Your ISU Routine Password</h2>
+        <p>Hello,</p>
+        <p>We received a request to reset your account password.</p>
+        <p>
+          <a href="${resetUrl}"
+             style="display:inline-block;padding:12px 20px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px">
+            Reset Password
+          </a>
+        </p>
+        <p>This link will expire in <strong>15 minutes</strong>.</p>
+        <p>If you did not request this, you can ignore this email.</p>
+        <p>ISU Student Routine Portal</p>
+      </div>
+    `,
+  });
+}
+
 
 // Ensure all API responses bypass client/proxy/browser cache completely
 router.use((req: Request, res: Response, next) => {
@@ -209,13 +270,27 @@ router.get('/semesters', async (req: Request, res: Response) => {
 // -------------------------------------------------------------
 
 router.post('/register', async (req: Request, res: Response) => {
-  const { student_id, name, password, department, batch_no, semester_id } = req.body;
-  const cleanedId = String(student_id || '').trim();
+  const {
+    student_id,
+    name,
+    email,
+    phone,
+    password,
+    department,
+    batch_no,
+    semester_id,
+  } = req.body;
 
-  if (!cleanedId || !name || !password || !department) {
+  const cleanedId = String(student_id || '').trim();
+  const studentName = String(name || '').trim();
+  const cleanedEmail = String(email || '').trim().toLowerCase();
+  const cleanedPhone = String(phone || '').trim();
+  const dept = String(department || '').trim();
+
+  if (!cleanedId || !studentName || !cleanedEmail || !password || !dept) {
     return res.status(400).json({
       success: false,
-      message: 'Please fill in all required fields (Student ID, Name, Password, Department).',
+      message: 'Please fill in all required fields (Student ID, Name, Email, Password, Department).',
     });
   }
 
@@ -223,6 +298,20 @@ router.post('/register', async (req: Request, res: Response) => {
     return res.status(400).json({
       success: false,
       message: 'Student ID must be at least 10 numeric digits (e.g. 2023100201).',
+    });
+  }
+
+  if (!/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(cleanedEmail)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Please enter a valid email address.',
+    });
+  }
+
+  if (String(password).length < 6) {
+    return res.status(400).json({
+      success: false,
+      message: 'Password must be at least 6 characters long.',
     });
   }
 
@@ -235,7 +324,11 @@ router.post('/register', async (req: Request, res: Response) => {
   }
 
   try {
-    const [existing]: any = await pool.query('SELECT id FROM students WHERE student_id = ?', [cleanedId]);
+    const [existing]: any = await pool.query(
+      'SELECT id FROM students WHERE student_id = ?',
+      [cleanedId]
+    );
+
     if (existing && existing.length > 0) {
       return res.status(400).json({
         success: false,
@@ -243,20 +336,39 @@ router.post('/register', async (req: Request, res: Response) => {
       });
     }
 
+    const [existingEmail]: any = await pool.query(
+      'SELECT id FROM students WHERE LOWER(email) = ?',
+      [cleanedEmail]
+    );
+
+    if (existingEmail && existingEmail.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'An account with this email already exists.',
+      });
+    }
+
     const semId = Number(semester_id) || 1;
     const batch = String(batch_no || '1st');
-    const studentName = String(name).trim();
-    const dept = String(department).trim();
-
-    // Securely hash the password before saving to MySQL
     const hashedPassword = await hashPassword(String(password));
 
     const [result]: any = await pool.query(
-      'INSERT INTO students (student_id, name, password_hash, department, batch_no, semester_id, total_credits, last_login) VALUES (?, ?, ?, ?, ?, ?, 0.0, NOW())',
-      [cleanedId, studentName, hashedPassword, dept, batch, semId]
+      `INSERT INTO students
+       (student_id, name, email, phone, password_hash, department, batch_no,
+        semester_id, total_credits, last_login)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0.0, NOW())`,
+      [
+        cleanedId,
+        studentName,
+        cleanedEmail,
+        cleanedPhone || null,
+        hashedPassword,
+        dept,
+        batch,
+        semId,
+      ]
     );
 
-    // Auto-enroll default courses from MySQL `courses` table
     const [defaultCourses]: any = await pool.query(
       'SELECT course_id, credit FROM courses WHERE department = ? AND semester_id = ? AND is_default = 1',
       [dept, semId]
@@ -271,7 +383,10 @@ router.post('/register', async (req: Request, res: Response) => {
         );
         totalCredits += parseFloat(String(c.credit)) || 0;
       }
-      await pool.query('UPDATE students SET total_credits = ? WHERE student_id = ?', [totalCredits, cleanedId]);
+      await pool.query(
+        'UPDATE students SET total_credits = ? WHERE student_id = ?',
+        [totalCredits, cleanedId]
+      );
     }
 
     const token = Buffer.from(`${cleanedId}:${Date.now()}`).toString('base64');
@@ -284,6 +399,8 @@ router.post('/register', async (req: Request, res: Response) => {
           id: result.insertId,
           student_id: cleanedId,
           name: studentName,
+          email: cleanedEmail,
+          phone: cleanedPhone || null,
           department: dept,
           batch_no: batch,
           semester_id: semId,
@@ -375,6 +492,143 @@ router.post('/login', async (req: Request, res: Response) => {
     return res.status(500).json({
       success: false,
       message: 'Login failed: ' + (err?.message || err),
+    });
+  }
+});
+
+// -------------------------------------------------------------
+// PASSWORD RECOVERY
+// -------------------------------------------------------------
+
+router.post('/forgot-password', async (req: Request, res: Response) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+
+  if (!email || !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(email)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Please provide a valid email address.',
+    });
+  }
+
+  const pool = await getMySqlPool();
+  if (!pool) {
+    return res.status(503).json({
+      success: false,
+      message: 'MySQL Database is currently unavailable.',
+    });
+  }
+
+  try {
+    const [rows]: any = await pool.query(
+      'SELECT id, student_id, email FROM students WHERE LOWER(email) = ? LIMIT 1',
+      [email]
+    );
+
+    const genericMessage =
+      'If an account exists with that email, a password-reset link has been sent.';
+
+    if (!rows || rows.length === 0) {
+      return res.json({ success: true, message: genericMessage });
+    }
+
+    const student = rows[0];
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
+
+    await pool.query(
+      'UPDATE students SET reset_token_hash = ?, reset_token_expires = ? WHERE id = ?',
+      [tokenHash, expiresAt, student.id]
+    );
+
+    const frontendUrl = (
+      process.env.FRONTEND_URL || 'https://isuapp.vercel.app'
+    ).replace(/\/+$/, '');
+
+    const resetUrl =
+      `${frontendUrl}/reset-password?token=${encodeURIComponent(rawToken)}`;
+
+    await sendPasswordResetEmail(email, resetUrl);
+
+    console.log(`[AUTH] Password reset email sent for student ${student.student_id}`);
+
+    return res.json({ success: true, message: genericMessage });
+  } catch (err: any) {
+    logDatabaseError(err, 'Forgot Password');
+    console.error('[AUTH] Forgot password error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to process password reset request.',
+    });
+  }
+});
+
+router.post('/reset-password', async (req: Request, res: Response) => {
+  const rawToken = String(req.body?.token || '').trim();
+  const newPassword = String(req.body?.new_password || '');
+
+  if (!rawToken || !newPassword) {
+    return res.status(400).json({
+      success: false,
+      message: 'Reset token and new password are required.',
+    });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({
+      success: false,
+      message: 'New password must be at least 6 characters long.',
+    });
+  }
+
+  const pool = await getMySqlPool();
+  if (!pool) {
+    return res.status(503).json({
+      success: false,
+      message: 'MySQL Database is currently unavailable.',
+    });
+  }
+
+  try {
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    const [rows]: any = await pool.query(
+      `SELECT id FROM students
+       WHERE reset_token_hash = ?
+         AND reset_token_expires IS NOT NULL
+         AND reset_token_expires > NOW()
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    if (!rows || rows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'This reset link is invalid or has expired.',
+      });
+    }
+
+    const hashedPassword = await hashPassword(newPassword);
+
+    await pool.query(
+      `UPDATE students
+       SET password_hash = ?,
+           reset_token_hash = NULL,
+           reset_token_expires = NULL
+       WHERE id = ?`,
+      [hashedPassword, rows[0].id]
+    );
+
+    return res.json({
+      success: true,
+      message: 'Password reset successful. You can now log in with your new password.',
+    });
+  } catch (err: any) {
+    logDatabaseError(err, 'Reset Password');
+    console.error('[AUTH] Reset password error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to reset password.',
     });
   }
 });

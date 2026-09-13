@@ -1,393 +1,484 @@
-import dotenv from 'dotenv';
-dotenv.config({ override: true });
-import mysql from 'mysql2/promise';
-import fs from 'fs';
-import path from 'path';
-import { migrateRawPasswordsToBcrypt } from './auth';
+// ============================================================
+// ISU Routine Backend - MySQL Database Configuration
+// ============================================================
 
-// File paths
-const ERROR_LOG_PATH = path.join(process.cwd(), 'database_error.log');
-const SQL_EXPORT_PATH = fs.existsSync(path.join(process.cwd(), 'database.sql'))
-  ? path.join(process.cwd(), 'database.sql')
-  : path.join(__dirname, 'database.sql');
+import mysql from "mysql2/promise";
+import "dotenv/config"; // Loads environment variables from your .env file
 
-export interface StudentRecord {
-  id: number;
-  student_id: string;
-  name: string;
+// ============================================================
+// DATABASE CONFIGURATION (Securely using .env)
+// ============================================================
+
+let DB_HOST = process.env.DB_HOST || "";
+let DB_PORT = Number(process.env.DB_PORT) || 3306;
+let DB_USER = process.env.DB_USER || "";
+let DB_PASSWORD = process.env.DB_PASSWORD || "";
+let DB_NAME = process.env.DB_NAME || "";
+
+const sslConfig = {
+  rejectUnauthorized: false,
+};
+
+// ============================================================
+// Types
+// ============================================================
+
+export type DatabaseErrorLog = {
+  message: string;
+  code?: string;
+  errno?: number;
+  sqlState?: string;
+  sql?: string;
+  timestamp: string;
+};
+
+export type MySqlConfig = {
+  host: string;
+  port: number;
+  user: string;
   password?: string;
-  department: string;
-  batch_no: string;
-  semester_id: number;
-  enrolled_courses: number[];
-  total_credits: number;
-  created_at?: string;
-  last_login?: string;
-}
-
-export interface DbStatusInfo {
-  type: 'mysql' | 'disconnected';
-  connected: boolean;
   database: string;
-  host: string;
-  port: number;
-  user: string;
-  lastError: string | null;
-  lastErrorTimestamp: string | null;
-  tablesCount: number;
-  recordsCount: {
-    departments: number;
-    semesters: number;
-    courses: number;
-    students: number;
-    routines: number;
-    notifications: number;
-  };
+  ssl?: boolean | object;
+};
+
+// ============================================================
+// Variables
+// ============================================================
+
+let pool: mysql.Pool | null = null;
+let connectionErrorShown = false;
+
+const databaseErrorLogs: DatabaseErrorLog[] = [];
+
+// ============================================================
+// Configuration log
+// ============================================================
+
+console.log("====================================================");
+console.log("[DB CONFIG] Host:", DB_HOST);
+console.log("[DB CONFIG] Port:", DB_PORT);
+console.log("[DB CONFIG] Database:", DB_NAME);
+console.log("[DB CONFIG] SSL: enabled");
+console.log("====================================================");
+
+// ============================================================
+// Create pool
+// ============================================================
+
+function createPool(): mysql.Pool {
+  return mysql.createPool({
+    host: DB_HOST,
+    port: DB_PORT,
+    user: DB_USER,
+    password: DB_PASSWORD,
+    database: DB_NAME,
+
+    waitForConnections: true,
+    connectionLimit: 10,
+    maxIdle: 10,
+    idleTimeout: 60000,
+    queueLimit: 0,
+
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0,
+
+    ssl: sslConfig,
+  });
 }
 
-// MySQL Connection Configuration
-export interface MySqlConfig {
-  host: string;
-  user: string;
-  password: string;
-  database: string;
-  port: number;
-  ssl?: any;
-}
+// ============================================================
+// Get MySQL pool
+// ============================================================
 
-// Helper to parse MySQL service URI (e.g. mysql://user:pass@host:port/db?ssl-mode=REQUIRED)
-export function parseDatabaseUri(uri: string): Partial<MySqlConfig> {
-  if (!uri || !uri.startsWith('mysql://')) return {};
+export async function getMySqlPool(): Promise<mysql.Pool | null> {
+  if (!pool) {
+    pool = createPool();
+  }
+
   try {
-    const parsed = new URL(uri);
-    return {
-      host: parsed.hostname || undefined,
-      port: parsed.port ? Number(parsed.port) : 10188,
-      user: parsed.username ? decodeURIComponent(parsed.username) : undefined,
-      password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
-      database: parsed.pathname ? parsed.pathname.replace(/^\//, '') : undefined,
-      ssl: { rejectUnauthorized: false },
-    };
-  } catch {
-    return {};
+    const connection = await pool.getConnection();
+    connection.release();
+
+    if (!connectionErrorShown) {
+      console.log(
+        `✅ Connected to MySQL Database successfully at ${DB_HOST}:${DB_PORT}/${DB_NAME}`
+      );
+      console.log("🚀 MySQL Database connection established successfully.");
+
+      connectionErrorShown = true;
+    }
+
+    return pool;
+  } catch (error: any) {
+    console.error("❌ MySQL Database connection failed:", {
+      code: error?.code,
+      message: error?.message,
+    });
+
+    return null;
   }
 }
 
-// Default Aiven Cloud MySQL connection parameters
-export const AIVEN_CONFIG: MySqlConfig = {
-  host: 'mysql-5fad108-canvamse-eafe.c.aivencloud.com',
-  user: 'avnadmin',
-  password: 'AVNS_pbIL7isrP691yOWBkl0',
-  database: 'isu_routine_db',
-  port: 10188,
-  ssl: { rejectUnauthorized: false },
-};
+// ============================================================
+// Update MySQL configuration
+// Required by routes.ts
+// ============================================================
 
-// Resolve configuration strictly from backend environment variables, with Aiven defaults
-export function resolveConfigFromEnv(): MySqlConfig {
-  const uriFromEnv =
-    process.env.DATABASE_URL ||
-    process.env.MYSQL_URL ||
-    process.env.DB_URI ||
-    process.env.MYSQL_SERVICE_URI ||
-    '';
-  const parsedFromUri = uriFromEnv ? parseDatabaseUri(uriFromEnv) : {};
+export async function updateMySqlConfig(
+  config: Partial<MySqlConfig>
+): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  try {
+    if (config.host !== undefined) {
+      DB_HOST = config.host;
+    }
 
-  // Ignore dummy container placeholder defaults (127.0.0.1, root, isu_routine_db, 3306)
-  const isGenericLocalHost = (h?: string) => !h || h === '127.0.0.1' || h === 'localhost';
-  const isGenericLocalUser = (u?: string) => !u || u === 'root';
-  const isGenericLocalDb = (d?: string) => !d || d === 'isu_routine_db';
-  const isGenericLocalPort = (p?: number | string) => !p || Number(p) === 3306;
+    if (config.port !== undefined) {
+      DB_PORT = Number(config.port);
+    }
 
-  const host =
-    (!isGenericLocalHost(process.env.MYSQL_HOST) ? process.env.MYSQL_HOST : undefined) ||
-    (!isGenericLocalHost(process.env.DB_HOST) ? process.env.DB_HOST : undefined) ||
-    parsedFromUri.host ||
-    AIVEN_CONFIG.host;
+    if (config.user !== undefined) {
+      DB_USER = config.user;
+    }
 
-  const user =
-    (!isGenericLocalUser(process.env.MYSQL_USER) ? process.env.MYSQL_USER : undefined) ||
-    (!isGenericLocalUser(process.env.DB_USER) ? process.env.DB_USER : undefined) ||
-    parsedFromUri.user ||
-    AIVEN_CONFIG.user;
+    if (config.password !== undefined) {
+      DB_PASSWORD = config.password;
+    }
 
-  const password =
-    process.env.MYSQL_PASSWORD ||
-    process.env.DB_PASSWORD ||
-    parsedFromUri.password ||
-    AIVEN_CONFIG.password;
+    if (config.database !== undefined) {
+      DB_NAME = config.database;
+    }
 
-  const database =
-    (!isGenericLocalDb(process.env.MYSQL_DATABASE) ? process.env.MYSQL_DATABASE : undefined) ||
-    (!isGenericLocalDb(process.env.DB_NAME) ? process.env.DB_NAME : undefined) ||
-    (!isGenericLocalDb(process.env.MYSQL_DB) ? process.env.MYSQL_DB : undefined) ||
-    parsedFromUri.database ||
-    AIVEN_CONFIG.database;
+    // Close the old pool so the next request uses new settings
+    if (pool) {
+      await pool.end();
+      pool = null;
+    }
 
-  const port = Number(
-    (!isGenericLocalPort(process.env.MYSQL_PORT) ? process.env.MYSQL_PORT : undefined) ||
-    (!isGenericLocalPort(process.env.DB_PORT) ? process.env.DB_PORT : undefined) ||
-    parsedFromUri.port ||
-    AIVEN_CONFIG.port
-  );
+    connectionErrorShown = false;
 
-  return {
-    host: host || AIVEN_CONFIG.host,
-    user: user || AIVEN_CONFIG.user,
-    password: password || AIVEN_CONFIG.password,
-    database: database || AIVEN_CONFIG.database,
-    port: port || AIVEN_CONFIG.port,
-    ssl: { rejectUnauthorized: false },
-  };
+    console.log("✅ MySQL configuration updated.");
+    console.log("[DB CONFIG] Host:", DB_HOST);
+    console.log("[DB CONFIG] Port:", DB_PORT);
+    console.log("[DB CONFIG] Database:", DB_NAME);
+
+    return {
+      success: true,
+      message: "MySQL configuration updated successfully.",
+    };
+  } catch (error: any) {
+    console.error("❌ Failed to update MySQL configuration:", error);
+
+    return {
+      success: false,
+      message: error?.message || "Failed to update MySQL configuration.",
+    };
+  }
 }
 
-export let MYSQL_CONFIG: MySqlConfig = resolveConfigFromEnv();
+// ============================================================
+// Generic query helper
+// ============================================================
 
-let lastDbError: { message: string; timestamp: string; code?: string; stack?: string } | null = null;
+export async function query<T = any>(
+  sql: string,
+  params: any[] = []
+): Promise<T> {
+  const db = await getMySqlPool();
 
-// Helper to log errors to database_error.log
-export function logDatabaseError(err: any, context = 'MySQL Query') {
-  if (!err) return;
-  const timestamp = new Date().toISOString();
-  const errorMsg = err?.message || String(err);
-  const errorCode = err?.code || 'UNKNOWN_ERROR';
-  const sqlState = err?.sqlState || 'N/A';
-  const stack = err?.stack || '';
+  if (!db) {
+    throw new Error("MySQL Database is currently unavailable.");
+  }
 
-  lastDbError = {
-    message: errorMsg,
-    timestamp,
-    code: errorCode,
-    stack,
+  try {
+    const [rows] = await db.query(sql, params);
+    return rows as T;
+  } catch (error: any) {
+    logDatabaseError(error, sql);
+    throw error;
+  }
+}
+
+// ============================================================
+// Log database error
+// ============================================================
+
+export function logDatabaseError(
+  error: any,
+  sql?: string
+): void {
+  const errorLog: DatabaseErrorLog = {
+    message: error?.message || String(error),
+    code: error?.code,
+    errno: error?.errno,
+    sqlState: error?.sqlState,
+    sql,
+    timestamp: new Date().toISOString(),
   };
 
-  // Skip writing to file for local refused errors if any
-  if (errorCode === 'ECONNREFUSED' && (!MYSQL_CONFIG.host || MYSQL_CONFIG.host === '127.0.0.1' || MYSQL_CONFIG.host === 'localhost')) {
+  databaseErrorLogs.push(errorLog);
+
+  if (databaseErrorLogs.length > 100) {
+    databaseErrorLogs.shift();
+  }
+
+  console.error("[DATABASE ERROR]", errorLog);
+}
+
+// ============================================================
+// Get database error logs
+// ============================================================
+
+export function getDatabaseErrorLogs(): DatabaseErrorLog[] {
+  return [...databaseErrorLogs];
+}
+
+// ============================================================
+// Clear database error logs
+// ============================================================
+
+export function clearDatabaseErrorLogs(): void {
+  databaseErrorLogs.length = 0;
+  console.log("✅ Database error logs cleared.");
+}
+
+// ============================================================
+// Get database status
+// ============================================================
+
+export async function getDatabaseStatus(): Promise<{
+  connected: boolean;
+  host: string;
+  port: number;
+  user: string;
+  database: string;
+  message: string;
+  timestamp: string;
+}> {
+  try {
+    const db = await getMySqlPool();
+
+    if (!db) {
+      return {
+        connected: false,
+        host: DB_HOST,
+        port: DB_PORT,
+        user: DB_USER,
+        database: DB_NAME,
+        message: "Database connection unavailable",
+        timestamp: new Date().toISOString(),
+      };
+    }
+
+    await db.query("SELECT 1");
+
+    return {
+      connected: true,
+      host: DB_HOST,
+      port: DB_PORT,
+      user: DB_USER,
+      database: DB_NAME,
+      message: "Database connection is healthy",
+      timestamp: new Date().toISOString(),
+    };
+  } catch (error: any) {
+    logDatabaseError(error);
+
+    return {
+      connected: false,
+      host: DB_HOST,
+      port: DB_PORT,
+      user: DB_USER,
+      database: DB_NAME,
+      message: error?.message || "Database connection failed",
+      timestamp: new Date().toISOString(),
+    };
+  }
+}
+
+// ============================================================
+// Generate full database SQL
+// ============================================================
+
+export async function generateFullDatabaseSql(): Promise<string> {
+  const db = await getMySqlPool();
+
+  if (!db) {
+    throw new Error("MySQL Database is currently unavailable.");
+  }
+
+  let sqlOutput = "";
+
+  sqlOutput += "-- =====================================================\n";
+  sqlOutput += "-- ISU Routine Database SQL Export\n";
+  sqlOutput += `-- Generated: ${new Date().toISOString()}\n`;
+  sqlOutput += "-- =====================================================\n\n";
+  sqlOutput += "SET FOREIGN_KEY_CHECKS = 0;\n\n";
+
+  const [tableRows] = await db.query("SHOW TABLES");
+  const tables = tableRows as Record<string, string>[];
+
+  for (const tableRow of tables) {
+    const tableName = Object.values(tableRow)[0];
+
+    if (!tableName) {
+      continue;
+    }
+
+    try {
+      const [createRows] = await db.query(
+        `SHOW CREATE TABLE \`${tableName}\``
+      );
+
+      const createRow = (createRows as Record<string, string>[])[0];
+
+      if (createRow) {
+        const createKey = Object.keys(createRow).find((key) =>
+          key.toLowerCase().startsWith("create table")
+        );
+
+        const createStatement = createKey
+          ? createRow[createKey]
+          : undefined;
+
+        if (createStatement) {
+          sqlOutput += `-- Table: ${tableName}\n`;
+          sqlOutput += `DROP TABLE IF EXISTS \`${tableName}\`;\n`;
+          sqlOutput += `${createStatement};\n\n`;
+        }
+      }
+
+      const [dataRows] = await db.query(
+        `SELECT * FROM \`${tableName}\``
+      );
+
+      const rows = dataRows as Record<string, any>[];
+
+      if (rows.length > 0) {
+        const columns = Object.keys(rows[0])
+          .map((column) => `\`${column}\``)
+          .join(", ");
+
+        for (const row of rows) {
+          const values = Object.keys(rows[0])
+            .map((column) => {
+              const value = row[column];
+
+              if (value === null || value === undefined) {
+                return "NULL";
+              }
+
+              if (typeof value === "number") {
+                return String(value);
+              }
+
+              if (typeof value === "boolean") {
+                return value ? "1" : "0";
+              }
+
+              if (value instanceof Date) {
+                const formattedDate = value
+                  .toISOString()
+                  .slice(0, 19)
+                  .replace("T", " ");
+
+                return `'${formattedDate}'`;
+              }
+
+              if (Buffer.isBuffer(value)) {
+                return `X'${value.toString("hex")}'`;
+              }
+
+              const escapedValue = String(value)
+                .replace(/\\/g, "\\\\")
+                .replace(/'/g, "''")
+                .replace(/\r/g, "\\r")
+                .replace(/\n/g, "\\n");
+
+              return `'${escapedValue}'`;
+            })
+            .join(", ");
+
+          sqlOutput +=
+            `INSERT INTO \`${tableName}\` (${columns}) VALUES (${values});\n`;
+        }
+
+        sqlOutput += "\n";
+      }
+    } catch (error: any) {
+      logDatabaseError(error, `Export table: ${tableName}`);
+
+      console.warn(
+        `[SQL EXPORT] Could not export table ${tableName}:`,
+        error?.message || error
+      );
+    }
+  }
+
+  sqlOutput += "SET FOREIGN_KEY_CHECKS = 1;\n";
+
+  return sqlOutput;
+}
+
+// ============================================================
+// Initialize notification table
+// ============================================================
+
+export async function initializeNotificationTables(): Promise<void> {
+  const db = await getMySqlPool();
+
+  if (!db) {
+    console.warn(
+      "⚠️ Skipping notification table initialization because MySQL is unavailable."
+    );
     return;
   }
 
-  const formattedLog = `[${timestamp}] [${errorCode}] [${context}]
-  Message: ${errorMsg}
-  SQLState: ${sqlState}
-  Host: ${MYSQL_CONFIG.host}:${MYSQL_CONFIG.port} | User: ${MYSQL_CONFIG.user} | Database: ${MYSQL_CONFIG.database}
-  Stack: ${stack || 'None'}
---------------------------------------------------------------------------------\n`;
-
   try {
-    fs.appendFileSync(ERROR_LOG_PATH, formattedLog, 'utf-8');
-  } catch (fsErr) {
-    console.error('Failed to append to database_error.log:', fsErr);
-  }
-}
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        student_id INT NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        type VARCHAR(50) DEFAULT 'general',
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-export function getDatabaseErrorLogs(): string {
-  try {
-    if (fs.existsSync(ERROR_LOG_PATH)) {
-      const content = fs.readFileSync(ERROR_LOG_PATH, 'utf-8').trim();
-      return content || 'No database errors recorded.';
-    }
-  } catch {}
-  return 'No database errors recorded.';
-}
-
-export function clearDatabaseErrorLogs(): boolean {
-  try {
-    fs.writeFileSync(ERROR_LOG_PATH, '', 'utf-8');
-    lastDbError = null;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function isMySqlConfigured(): boolean {
-  return true;
-}
-
-export function updateMySqlConfig(newConfig: Partial<MySqlConfig> & { serviceUri?: string }) {
-  let parsedFromUri: Partial<MySqlConfig> = {};
-  if (newConfig.serviceUri) {
-    parsedFromUri = parseDatabaseUri(newConfig.serviceUri);
-  }
-
-  MYSQL_CONFIG = {
-    ...MYSQL_CONFIG,
-    ...parsedFromUri,
-    ...newConfig,
-    port: Number(newConfig.port || parsedFromUri.port || MYSQL_CONFIG.port),
-    ssl: { rejectUnauthorized: false },
-  };
-  if (pool) {
-    try {
-      pool.end().catch(() => {});
-    } catch {}
-    pool = null;
-  }
-  isMySqlConnected = false;
-  lastConnectionAttemptTime = 0;
-}
-
-// -------------------------------------------------------------
-// MYSQL POOL
-// -------------------------------------------------------------
-
-let pool: mysql.Pool | null = null;
-let isMySqlConnected = false;
-let lastConnectionAttemptTime = 0;
-const CONNECTION_COOLDOWN_MS = 15000;
-
-function buildPoolOptions(config: MySqlConfig): mysql.PoolOptions {
-  return {
-    host: config.host,
-    port: config.port,
-    user: config.user,
-    password: config.password,
-    database: config.database,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0,
-    multipleStatements: true,
-    connectTimeout: 10000,
-    ssl: config.ssl ?? { rejectUnauthorized: false },
-  };
-}
-
-export async function getMySqlPool(forceRetry = false): Promise<mysql.Pool | null> {
-  if (pool && isMySqlConnected) return pool;
-
-  const now = Date.now();
-  if (!forceRetry && lastConnectionAttemptTime > 0 && now - lastConnectionAttemptTime < CONNECTION_COOLDOWN_MS) {
-    return null;
-  }
-  lastConnectionAttemptTime = now;
-
-  try {
-    pool = mysql.createPool(buildPoolOptions(MYSQL_CONFIG));
-    const connection = await pool.getConnection();
-    isMySqlConnected = true;
-    lastDbError = null;
-
-    console.log(
-      '✅ Connected to MySQL Database successfully at',
-      `${MYSQL_CONFIG.host}:${MYSQL_CONFIG.port}/${MYSQL_CONFIG.database} (User: ${MYSQL_CONFIG.user})`
-    );
-    connection.release();
-
-    // Migrate any legacy passwords to bcrypt
-    migrateRawPasswordsToBcrypt(pool).catch(() => {});
-
-    // Ensure notification audience & read-tracking tables are up to date
-    initializeNotificationTables(pool).catch(() => {});
-
-    return pool;
-  } catch (err: any) {
-    if (pool) {
-      try {
-        await pool.end().catch(() => {});
-      } catch {}
-      pool = null;
-    }
-    isMySqlConnected = false;
-    logDatabaseError(err, `MySQL Connection (${MYSQL_CONFIG.host}:${MYSQL_CONFIG.port}/${MYSQL_CONFIG.database})`);
-    console.error(`[MySQL Error] Could not connect: ${err?.message || err}`);
-  }
-
-  return null;
-}
-
-export async function getDatabaseStatus(): Promise<DbStatusInfo> {
-  const p = await getMySqlPool();
-  const counts = {
-    departments: 0,
-    semesters: 0,
-    courses: 0,
-    students: 0,
-    routines: 0,
-    notifications: 0,
-  };
-
-  if (p && isMySqlConnected) {
-    try {
-      const [c1]: any = await p.query('SELECT count(*) as c FROM departments');
-      const [c2]: any = await p.query('SELECT count(*) as c FROM semesters');
-      const [c3]: any = await p.query('SELECT count(*) as c FROM courses');
-      const [c4]: any = await p.query('SELECT count(*) as c FROM students');
-      const [c5]: any = await p.query('SELECT count(*) as c FROM routines');
-      const [c6]: any = await p.query('SELECT count(*) as c FROM notifications');
-      counts.departments = c1[0]?.c || 0;
-      counts.semesters = c2[0]?.c || 0;
-      counts.courses = c3[0]?.c || 0;
-      counts.students = c4[0]?.c || 0;
-      counts.routines = c5[0]?.c || 0;
-      counts.notifications = c6[0]?.c || 0;
-    } catch {}
-  }
-
-  return {
-    type: isMySqlConnected ? 'mysql' : 'disconnected',
-    connected: isMySqlConnected,
-    database: MYSQL_CONFIG.database,
-    host: MYSQL_CONFIG.host,
-    port: MYSQL_CONFIG.port,
-    user: MYSQL_CONFIG.user,
-    lastError: lastDbError?.message || null,
-    lastErrorTimestamp: lastDbError?.timestamp || null,
-    tablesCount: 7,
-    recordsCount: counts,
-  };
-}
-
-export function generateFullDatabaseSql(): string {
-  try {
-    if (fs.existsSync(SQL_EXPORT_PATH)) {
-      return fs.readFileSync(SQL_EXPORT_PATH, 'utf-8');
-    }
-  } catch {}
-  return '';
-}
-
-export function exportDatabaseSqlFile() {
-  if (!fs.existsSync(SQL_EXPORT_PATH)) {
-    console.log(`ℹ️ Schema file ${SQL_EXPORT_PATH} is present and maintained.`);
-  }
-}
-
-/**
- * Ensures student_notification_reads table exists and notifications table
- * has target_type and created_by columns for course/semester-wide broadcasts.
- */
-export async function initializeNotificationTables(p: mysql.Pool) {
-  try {
-    // 1. Ensure student_notification_reads table exists
-    await p.query(`
-      CREATE TABLE IF NOT EXISTS student_notification_reads (
-        student_id VARCHAR(50) NOT NULL,
-        notification_id INT NOT NULL,
-        read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (student_id, notification_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        INDEX idx_notifications_student_id (student_id),
+        INDEX idx_notifications_is_read (is_read)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     `);
 
-    // 2. Ensure notifications columns are upgraded
-    const [cols]: any = await p.query('DESCRIBE notifications');
-    const colNames = Array.isArray(cols) ? cols.map((c: any) => c.Field) : [];
+    console.log("✅ Notification tables initialized successfully.");
+  } catch (error: any) {
+    logDatabaseError(error);
 
-    if (!colNames.includes('target_type')) {
-      await p.query("ALTER TABLE notifications ADD COLUMN target_type VARCHAR(20) NOT NULL DEFAULT 'all' AFTER id");
-    }
-    if (!colNames.includes('created_by')) {
-      await p.query("ALTER TABLE notifications ADD COLUMN created_by VARCHAR(100) NULL AFTER link");
-    }
-
-    // 3. Make sure id is AUTO_INCREMENT if not already
-    const idCol = Array.isArray(cols) ? cols.find((c: any) => c.Field === 'id') : null;
-    if (idCol && !idCol.Extra?.includes('auto_increment')) {
-      try {
-        await p.query('ALTER TABLE notifications MODIFY COLUMN id INT AUTO_INCREMENT');
-      } catch {}
-    }
-  } catch (err: any) {
-    console.error('Notice on initializing notification tables:', err?.message || err);
+    console.warn(
+      "Notice on initializing notification tables:",
+      error?.message || error
+    );
   }
 }
 
+// ============================================================
+// Close MySQL pool
+// ============================================================
+
+export async function closeMySqlPool(): Promise<void> {
+  if (pool) {
+    await pool.end();
+    pool = null;
+    connectionErrorShown = false;
+
+    console.log("🛑 MySQL Database connection closed.");
+  }
+}
+
+// ============================================================
+// Default export
+// ============================================================
+
+export default getMySqlPool;
