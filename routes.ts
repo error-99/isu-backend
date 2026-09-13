@@ -20,6 +20,14 @@ const router = Router();
 // PASSWORD RESET EMAIL CONFIGURATION
 // -------------------------------------------------------------
 
+// -------------------------------------------------------------
+// PASSWORD RESET EMAIL CONFIGURATION
+// -------------------------------------------------------------
+import dns from 'dns';
+
+// Force Node.js to use IPv4, fixing the ENETUNREACH error on Railway
+dns.setDefaultResultOrder('ipv4first');
+
 const emailTransporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: Number(process.env.SMTP_PORT || 465),
