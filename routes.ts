@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 import {
   getMySqlPool,
   StudentRecord,
@@ -10,59 +10,26 @@ import {
   logDatabaseError,
   updateMySqlConfig,
   generateFullDatabaseSql,
-  MYSQL_CONFIG,
 } from './db';
 import { hashPassword, verifyPassword, isBcryptHash } from './auth';
 
 const router = Router();
 
 // -------------------------------------------------------------
-// PASSWORD RESET EMAIL CONFIGURATION
+// PASSWORD RESET EMAIL CONFIGURATION (Resend API)
 // -------------------------------------------------------------
 
-// -------------------------------------------------------------
-// PASSWORD RESET EMAIL CONFIGURATION
-// -------------------------------------------------------------
-import dns from 'dns';
-
-// Force Node.js to use IPv4, fixing the ENETUNREACH error on Railway
-dns.setDefaultResultOrder('ipv4first');
-
-const emailTransporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.gmail.com',
-  port: Number(process.env.SMTP_PORT || 465),
-  secure: process.env.SMTP_SECURE !== 'false',
-  auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
-  },
-});
+// Initialize Resend with your API key from .env
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 async function sendPasswordResetEmail(
   email: string,
   resetUrl: string
 ): Promise<void> {
-  const from =
-    process.env.SMTP_FROM ||
-    process.env.SMTP_USER ||
-    'no-reply@isuapp.com';
-
-  await emailTransporter.sendMail({
-    from,
+  const { error } = await resend.emails.send({
+    from: 'ISU Routine Portal <onboarding@resend.dev>', // Free testing domain provided by Resend
     to: email,
     subject: 'Reset Your ISU Routine Password',
-    text: [
-      'Hello,',
-      '',
-      'We received a request to reset your ISU Routine account password.',
-      '',
-      `Reset your password using this link: ${resetUrl}`,
-      '',
-      'This link will expire in 15 minutes.',
-      'If you did not request this, you can ignore this email.',
-      '',
-      'ISU Student Routine Portal',
-    ].join('\n'),
     html: `
       <div style="font-family:Arial,sans-serif;line-height:1.6;max-width:600px;margin:auto">
         <h2>Reset Your ISU Routine Password</h2>
@@ -80,8 +47,11 @@ async function sendPasswordResetEmail(
       </div>
     `,
   });
-}
 
+  if (error) {
+    throw new Error(`Resend API Error: ${error.message}`);
+  }
+}
 
 // Ensure all API responses bypass client/proxy/browser cache completely
 router.use((req: Request, res: Response, next) => {
@@ -121,6 +91,8 @@ export async function getAuthStudent(req: Request): Promise<StudentRecord | null
       id: row.id,
       student_id: row.student_id,
       name: row.name,
+      email: row.email,
+      phone: row.phone,
       department: row.department,
       batch_no: row.batch_no,
       semester_id: Number(row.semester_id),
@@ -464,7 +436,6 @@ router.post('/login', async (req: Request, res: Response) => {
       });
     }
 
-    // Auto-migrate legacy plain-text password to bcrypt hash on successful login
     if (!isBcryptHash(row.password_hash)) {
       try {
         const upgradedHash = await hashPassword(String(password));
@@ -486,6 +457,8 @@ router.post('/login', async (req: Request, res: Response) => {
           id: row.id,
           student_id: row.student_id,
           name: row.name,
+          email: row.email,
+          phone: row.phone,
           department: row.department,
           batch_no: row.batch_no,
           semester_id: Number(row.semester_id),
@@ -553,12 +526,11 @@ router.post('/forgot-password', async (req: Request, res: Response) => {
       process.env.FRONTEND_URL || 'https://isuapp.vercel.app'
     ).replace(/\/+$/, '');
 
-    const resetUrl =
-      `${frontendUrl}/reset-password?token=${encodeURIComponent(rawToken)}`;
+    const resetUrl = `${frontendUrl}/reset-password?token=${encodeURIComponent(rawToken)}`;
 
     await sendPasswordResetEmail(email, resetUrl);
 
-    console.log(`[AUTH] Password reset email sent for student ${student.student_id}`);
+    console.log(`[AUTH] Password reset email sent via Resend for student ${student.student_id}`);
 
     return res.json({ success: true, message: genericMessage });
   } catch (err: any) {
@@ -665,7 +637,6 @@ router.all('/user', async (req: Request, res: Response) => {
   }
 
   try {
-    // Profile ME
     if (action === 'me') {
       const [semRows]: any = await pool.query('SELECT * FROM semesters WHERE id = ?', [student.semester_id]);
       const current_semester = semRows && semRows.length > 0 ? semRows[0] : undefined;
@@ -677,6 +648,8 @@ router.all('/user', async (req: Request, res: Response) => {
             id: student.id,
             student_id: student.student_id,
             name: student.name,
+            email: student.email,
+            phone: student.phone,
             department: student.department,
             batch_no: student.batch_no,
             semester_id: student.semester_id,
@@ -688,7 +661,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Courses Enrolled by Student (from `student_courses` joined with `courses`)
     if (action === 'courses') {
       const [rows]: any = await pool.query(
         `SELECT c.*, sc.enrolled_at 
@@ -716,7 +688,6 @@ router.all('/user', async (req: Request, res: Response) => {
 
       const total_credits = enrolledCourses.reduce((acc, c) => acc + c.credit, 0);
 
-      // Keep student's total_credits updated in MySQL
       if (total_credits !== student.total_credits) {
         await pool.query('UPDATE students SET total_credits = ? WHERE student_id = ?', [
           totalCredits(enrolledCourses),
@@ -733,7 +704,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Available Courses for student's department from MySQL
     if (action === 'available_courses') {
       const [rows]: any = await pool.query(
         `SELECT c.*, 
@@ -782,7 +752,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Add Course
     if (action === 'add_course') {
       const course_id = Number(req.body?.course_id);
       if (!course_id || isNaN(course_id)) {
@@ -814,7 +783,6 @@ router.all('/user', async (req: Request, res: Response) => {
         [student.student_id, course_id, course.semester_id]
       );
 
-      // Recalculate credits
       const [sumRows]: any = await pool.query(
         `SELECT SUM(c.credit) as total 
          FROM student_courses sc 
@@ -849,7 +817,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Remove / Drop Course
     if (action === 'remove_course') {
       const course_id = Number(req.body?.course_id);
       if (!course_id || isNaN(course_id)) {
@@ -861,7 +828,6 @@ router.all('/user', async (req: Request, res: Response) => {
         course_id,
       ]);
 
-      // Recalculate credits
       const [sumRows]: any = await pool.query(
         `SELECT SUM(c.credit) as total 
          FROM student_courses sc 
@@ -891,7 +857,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Class Routines from MySQL
     if (action === 'routine') {
       const day = req.query.day as string;
       const course_id = req.query.course_id ? Number(req.query.course_id) : null;
@@ -928,7 +893,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Class Tests (CTs) from MySQL
     if (action === 'ct') {
       if (student.enrolled_courses.length === 0) {
         return res.json({ success: true, data: { routine: [] } });
@@ -949,7 +913,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Midterm & Final Exams from MySQL
     if (action === 'exams') {
       if (student.enrolled_courses.length === 0) {
         return res.json({ success: true, data: { routine: [] } });
@@ -970,7 +933,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Notifications operations
     if (
       action === 'notifications' ||
       action === 'unread_count' ||
@@ -984,7 +946,6 @@ router.all('/user', async (req: Request, res: Response) => {
       return handleNotificationOperations(req, res, student, pool, String(action));
     }
 
-    // Change Name
     if (action === 'change_name') {
       const newName = String(req.body?.name || '').trim();
       if (!newName) {
@@ -997,8 +958,20 @@ router.all('/user', async (req: Request, res: Response) => {
         data: { name: newName },
       });
     }
+    
+    if (action === 'change_student_id') {
+      const newId = String(req.body?.student_id || '').trim();
+      if (!newId || newId.length < 10) {
+        return res.status(400).json({ success: false, message: 'Invalid Student ID' });
+      }
+      await pool.query('UPDATE students SET student_id = ? WHERE student_id = ?', [newId, student.student_id]);
+      return res.json({
+        success: true,
+        message: 'Student ID updated successfully',
+        data: { student_id: newId },
+      });
+    }
 
-    // Change Batch
     if (action === 'change_batch') {
       const newBatch = String(req.body?.batch_no || '').trim();
       if (!newBatch) {
@@ -1012,7 +985,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Change Semester (and auto-enroll new semester default courses)
     if (action === 'change_semester') {
       const newSemester = Number(req.body?.semester_id);
       if (!newSemester || isNaN(newSemester)) {
@@ -1024,7 +996,6 @@ router.all('/user', async (req: Request, res: Response) => {
         student.student_id,
       ]);
 
-      // Remove current enrolled and auto-enroll defaults for the new semester
       await pool.query('DELETE FROM student_courses WHERE student_id = ?', [student.student_id]);
 
       const [defaultCourses]: any = await pool.query(
@@ -1058,7 +1029,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Change Department
     if (action === 'change_department') {
       const newDept = String(req.body?.department || '').trim();
       if (!newDept) {
@@ -1099,7 +1069,6 @@ router.all('/user', async (req: Request, res: Response) => {
       });
     }
 
-    // Change Password
     if (action === 'change_password') {
       const currentPassword = String(req.body?.current_password || req.body?.old_password || '');
       const newPassword = String(req.body?.new_password || '');
@@ -1129,7 +1098,6 @@ router.all('/user', async (req: Request, res: Response) => {
         });
       }
 
-      // Securely hash the new password before storing in MySQL
       const hashedNewPassword = await hashPassword(newPassword);
 
       await pool.query('UPDATE students SET password_hash = ? WHERE student_id = ?', [
@@ -1161,8 +1129,7 @@ function totalCredits(courses: any[]): number {
 }
 
 // -------------------------------------------------------------
-// 5. NOTIFICATIONS CONTROLLER & DEDICATED ROUTE
-// (Auto Course-enrolled, Semester-wide, Department, University-wide, & individual student_notification_reads)
+// 5. NOTIFICATIONS CONTROLLER
 // -------------------------------------------------------------
 
 async function handleNotificationOperations(
@@ -1172,7 +1139,6 @@ async function handleNotificationOperations(
   pool: any,
   action: string
 ) {
-  // 1. UNREAD COUNT
   if (action === 'unread_count') {
     const enrolledCourses =
       Array.isArray(student.enrolled_courses) && student.enrolled_courses.length > 0
@@ -1208,7 +1174,6 @@ async function handleNotificationOperations(
     });
   }
 
-  // 2. LIST NOTIFICATIONS
   if (action === 'list' || action === 'notifications') {
     const typeFilter = String(req.query.type || req.body?.type || '').trim();
     const enrolledCourses =
@@ -1224,15 +1189,10 @@ async function handleNotificationOperations(
       LEFT JOIN student_notification_reads snr 
         ON n.id = snr.notification_id AND snr.student_id = ?
       WHERE (
-        -- 1. All university broadcasts
         n.department = 'ALL' OR n.target_type = 'all'
-        -- 2. Entire department broadcasts
         OR (n.department = ? AND (n.target_type = 'department' OR (n.semester_id IS NULL AND n.course_id IS NULL AND n.student_id IS NULL)))
-        -- 3. Semester-wide broadcasts (student's current semester & department)
         OR (n.department = ? AND n.semester_id = ? AND (n.target_type = 'semester' OR (n.course_id IS NULL AND n.student_id IS NULL)))
-        -- 4. Course-wise broadcasts: Auto-delivered to every student enrolled in that course!
         OR (n.course_id IS NOT NULL AND n.course_id IN (?))
-        -- 5. Direct personal message (if student_id explicitly specified)
         OR (n.student_id = ?)
       )
     `;
@@ -1271,7 +1231,6 @@ async function handleNotificationOperations(
     });
   }
 
-  // 3. MARK SINGLE NOTIFICATION AS READ (Per-student read tracking)
   if (action === 'mark_read' || action === 'read_notification') {
     const notifId = Number(
       req.body?.notification_id || req.body?.id || req.query.notification_id || req.query.id
@@ -1285,7 +1244,6 @@ async function handleNotificationOperations(
     return res.json({ success: true, data: { id: notifId, is_read: true } });
   }
 
-  // 4. MARK ALL NOTIFICATIONS AS READ (Per-student read tracking)
   if (action === 'mark_all_read' || action === 'read_all_notifications') {
     const enrolledCourses =
       Array.isArray(student.enrolled_courses) && student.enrolled_courses.length > 0
@@ -1327,7 +1285,6 @@ async function handleNotificationOperations(
     });
   }
 
-  // 5. CREATE / PUBLISH ANNOUNCEMENT (Broadcast Course-wise, Semester-wise, Department, or University-wide)
   if (action === 'create_notification' || action === 'add_notification' || action === 'create') {
     const title = String(req.body?.title || '').trim();
     const message = String(req.body?.message || '').trim();
@@ -1374,7 +1331,7 @@ async function handleNotificationOperations(
     );
 
     const targetDesc = courseCode
-      ? `course ${courseCode} (automatically delivered to all enrolled students)`
+      ? `course ${courseCode}`
       : semester_id
       ? `Semester ${semester_id}`
       : department !== 'ALL'
@@ -1402,7 +1359,6 @@ async function handleNotificationOperations(
   return res.status(400).json({ success: false, message: `Unknown notification action: ${action}` });
 }
 
-// Dedicated notifications endpoint matching frontend api.ts
 router.all('/notifications', async (req: Request, res: Response) => {
   const student = await getAuthStudent(req);
   if (!student) {
@@ -1432,10 +1388,9 @@ router.all('/notifications', async (req: Request, res: Response) => {
   }
 });
 
-// Universal Proxy endpoint to bypass browser CORS or mixed-content limitations when connecting to remote backends
+// Universal Proxy endpoint
 router.all('/proxy', async (req: Request, res: Response) => {
   const target = req.query.target as string;
-  console.log('🔄 /api/proxy called with target:', target);
   if (!target || !target.startsWith('http')) {
     return res.status(400).json({
       success: false,
@@ -1449,24 +1404,15 @@ router.all('/proxy', async (req: Request, res: Response) => {
       Accept: 'application/json, text/plain, */*',
     };
 
-    if (req.headers['content-type']) {
-      headers['Content-Type'] = req.headers['content-type'] as string;
-    }
-    if (req.headers.authorization) {
-      headers['Authorization'] = req.headers.authorization as string;
-    }
+    if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'] as string;
+    if (req.headers.authorization) headers['Authorization'] = req.headers.authorization as string;
 
     const fetchOptions: any = {
       method: req.method,
       headers,
     };
 
-    if (
-      req.method !== 'GET' &&
-      req.method !== 'HEAD' &&
-      req.body &&
-      Object.keys(req.body).length > 0
-    ) {
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && Object.keys(req.body).length > 0) {
       fetchOptions.body = JSON.stringify(req.body);
     }
 
@@ -1482,7 +1428,6 @@ router.all('/proxy', async (req: Request, res: Response) => {
       return res.send(text);
     }
   } catch (err: any) {
-    console.error('⚠️ /api/proxy error:', err);
     return res.status(502).json({
       success: false,
       message: `Proxy failed to connect to remote server: ${err?.message || err}`,
